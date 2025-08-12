@@ -2,6 +2,9 @@
 #include <Adafruit_GFX.h>               // 그래픽(글자/도형) 그리는 라이브러리
 #include <Adafruit_SSD1306.h>           // SSD1306 OLED 화면을 쓰기 위한 라이브러리
 #include <EEPROM.h>                     // 전원을 꺼도 값이 남는 저장공간(EEPROM)을 쓰기 위한 라이브러리
+#include <Arduino.h>                    // pinMode, digitalWrite 등 Arduino API
+#include <avr/io.h>                     // AVR 레지스터
+#include <avr/interrupt.h>              // ISR, 인터럽트 제어
 
 #define SCREEN_WIDTH 128                // OLED 가로 픽셀 수(128칸)
 #define SCREEN_HEIGHT 32                // OLED 세로 픽셀 수(32칸)
@@ -66,7 +69,7 @@ const uint8_t BTN_PLUNGER_DN = 7;       // 플런저 D값을 -200(방울 -1) 줄
 
 // ===== 현재 위치/목표 위치(단위: 스텝) =====
 
-long curX = 0, curY = 0;      // curX/Y/Z: 지금 모터가 실제로 서 있는 자리(스텝)
+long curX = 0, curY = 0, curZ = 0;      // curX/Y/Z: 지금 모터가 실제로 서 있는 자리(스텝)
 long tgtX = 0, tgtY = 0, tgtZ = 0;      // tgtX/Y/Z: 우리가 가고 싶은 목표 자리(스텝)
 
 
@@ -104,20 +107,37 @@ inline void clampDrop() {
 
 
 // ===== EEPROM(전원 꺼도 남는 저장소)에 저장할 자료 모양 =====
-struct PersistV3 {                       // 지금 형식: X,Y,Z, dropSteps(D) 저장
-  uint32_t magic;                        // 저장 형식 버전 번호
-  long tgtX;                             // 저장할 목표 X
-  long tgtY;                             // 저장할 목표 Y
-  long tgtZ;                             // 저장할 목표 Z
-  long dropSteps;                        // 저장할 플런저 총 누르는 양 D
+struct PersistV4 {                       // ★ 실제 위치(curX/Y/Z)와 dropSteps를 저장
+  uint32_t magic;
+  long curX;
+  long curY;
+  long curZ;
+  long dropSteps;
+};
+struct PersistV3 {                       // 과거 호환: X,Y,Z, dropSteps(D) 저장
+  uint32_t magic;
+  long tgtX;
+  long tgtY;
+  long tgtZ;
+  long dropSteps;
 };
 
-const uint32_t MAGIC_V3 = 0xC0FFEE78;    // V3 형식이라는 표시(현재)
+const uint32_t MAGIC_V4 = 0xC0FFEE79;    // V4 형식(현재)
+const uint32_t MAGIC_V3 = 0xC0FFEE78;    // V3 형식(과거)
 const int EEPROM_ADDR = 0;               // EEPROM의 0번 주소부터 저장 시작
 
 bool needSave = false;                   // 지금 값이 바뀌었고, 조금 있다 저장해야 함을 알리는 깃발
 unsigned long lastEditMs = 0;            // 마지막으로 값이 바뀐 시간(밀리초)
-const unsigned long SAVE_DELAY_MS = 1500;// 값이 바뀐 뒤 1.5초 동안 더 안 바뀌면 그때 저장
+const unsigned long SAVE_DELAY_MS = 100;// 값이 바뀐 뒤 1.5초 동안 더 안 바뀌면 그때 저장
+
+// ★ 이동 중 현재 위치를 너무 자주 쓰지 않도록 쓰기 쓰로틀
+const unsigned long POS_SAVE_INTERVAL_MS = 50;     // 최소 저장 간격(ms)
+const long          POS_SAVE_DELTA_STEPS = 50;     // 위치 변화가 이 이상이면 저장 고려
+unsigned long lastPosSaveMs = 0;
+long lastSavedX = 0, lastSavedY = 0, lastSavedZ = 0;
+
+// ★ OLED 갱신 쓰로틀(현재 표시중인 정수 단위)
+long lastOLEDUnitX = 0, lastOLEDUnitY = 0, lastOLEDUnitZ = 0;
 
 
 // ===== 버튼 이벤트(버튼을 눌렀는지, 오래 눌렀는지) =====
@@ -129,19 +149,141 @@ static inline void stepHalf(uint8_t PUL, int half_us) {
   digitalWrite(PUL, LOW);   delayMicroseconds(half_us); // 다시 LOW로 내림(모터 한 번 스텝)
 }
 
-// 모터를 정해진 스텝 수만큼 움직이는 함수
-void moveSteps(uint8_t PUL, uint8_t DIR, uint8_t dirLevel, long steps, int half_us) {
-  if (steps <= 0) return;                      // 0이하이면 할 일이 없음
-  digitalWrite(DIR, dirLevel);                 // 모터가 도는 방향을 정함
-  delayMicroseconds(100);                      // 방향을 바꿨으니 100us 쉬어서 안정화
-  for (long i = 0; i < steps; i++) stepHalf(PUL, half_us); // 정해진 만큼 스텝 반복
+
+// ─────────────────────────────────────────────────────────────────────
+// [추가] 타이머 기반 스텝 드라이버 (Timer1 = Y축, Timer3 = X축)
+// ─────────────────────────────────────────────────────────────────────
+
+// 진행 중 여부(재진입 방지용)
+volatile bool isMoving = false;
+
+// ===== Timer1(여기서는 'Y축'= 보드 X_PUL/X_DIR) 진행량 =====
+volatile uint8_t* T1_PUL_PORT;
+volatile uint8_t  T1_PUL_MASK;
+volatile long     T1_steps_remaining = 0;
+volatile long     T1_steps_done = 0;     // ISR에서 완료 스텝 누적
+volatile int8_t   T1_step_sign  = +1;
+volatile bool     T1_pulse_state = false;
+
+// ===== Timer3(여기서는 'X축'= 보드 Z_PUL/Z_DIR) 진행량 =====
+volatile uint8_t* T3_PUL_PORT;
+volatile uint8_t  T3_PUL_MASK;
+volatile long     T3_steps_remaining = 0;
+volatile long     T3_steps_done = 0;
+volatile int8_t   T3_step_sign  = +1;
+volatile bool     T3_pulse_state = false;
+
+// 타이머1 비교일치 A ISR (Y축)
+ISR(TIMER1_COMPA_vect) {
+  if (T1_steps_remaining > 0) {
+    if (T1_pulse_state) {
+      *T1_PUL_PORT |=  T1_PUL_MASK;   // HIGH
+    } else {
+      *T1_PUL_PORT &= ~T1_PUL_MASK;   // LOW
+      T1_steps_remaining--;
+      T1_steps_done++;                // 한 스텝 완료
+    }
+    T1_pulse_state = !T1_pulse_state;
+  } else {
+    TIMSK &= ~(1 << OCIE1A);          // Timer1 IRQ off
+    *T1_PUL_PORT &= ~T1_PUL_MASK;     // 핀 LOW 유지
+  }
 }
 
+// 타이머3 비교일치 A ISR (X축)  ※ ATmega128: ETIMSK 사용
+ISR(TIMER3_COMPA_vect) {
+  if (T3_steps_remaining > 0) {
+    if (T3_pulse_state) {
+      *T3_PUL_PORT |=  T3_PUL_MASK;   // HIGH
+    } else {
+      *T3_PUL_PORT &= ~T3_PUL_MASK;   // LOW
+      T3_steps_remaining--;
+      T3_steps_done++;                // 한 스텝 완료
+    }
+    T3_pulse_state = !T3_pulse_state;
+  } else {
+    ETIMSK &= ~(1 << OCIE3A);         // Timer3 IRQ off
+    *T3_PUL_PORT &= ~T3_PUL_MASK;     // 핀 LOW 유지
+  }
+}
+
+// half_us = 반주기(us) → 1스텝 주기 = 2*half_us
+static inline void startTimerMotor(
+  uint8_t timer_id, uint8_t pulPin, uint8_t dirPin, uint8_t dirLevel,
+  long steps, int half_us, int8_t step_sign
+){
+  if (steps <= 0) return;
+
+  // 핀 설정
+  pinMode(pulPin, OUTPUT);
+  pinMode(dirPin, OUTPUT);
+  digitalWrite(dirPin, dirLevel);
+  delayMicroseconds(100);   // 방향 안정화
+
+  noInterrupts();
+
+  // OCR 계산 (분주 8, CTC)
+  // OCR = (F_CPU/8)*half_us/1e6 - 1
+  uint32_t ocr = (uint32_t)(((uint64_t)F_CPU / 8ULL) * (uint64_t)half_us / 1000000ULL);
+  if (ocr == 0) ocr = 1;
+  ocr -= 1;
+
+  if (timer_id == 1) {
+    T1_PUL_PORT = portOutputRegister(digitalPinToPort(pulPin));
+    T1_PUL_MASK = digitalPinToBitMask(pulPin);
+    T1_steps_remaining = steps;
+    T1_steps_done = 0;
+    T1_step_sign = step_sign;
+    T1_pulse_state = false;
+
+    TCCR1A = 0; TCCR1B = 0; TCNT1 = 0;
+    TCCR1B |= (1 << WGM12);         // CTC
+    OCR1A   = (uint16_t)ocr;
+    TCCR1B |= (1 << CS11);          // /8
+    TIMSK  |= (1 << OCIE1A);        // IRQ on
+  }
+  else if (timer_id == 3) {
+    T3_PUL_PORT = portOutputRegister(digitalPinToPort(pulPin));
+    T3_PUL_MASK = digitalPinToBitMask(pulPin);
+    T3_steps_remaining = steps;
+    T3_steps_done = 0;
+    T3_step_sign = step_sign;
+    T3_pulse_state = false;
+
+    TCCR3A = 0; TCCR3B = 0; TCNT3 = 0;
+    TCCR3B |= (1 << WGM32);         // CTC
+    OCR3A   = (uint16_t)ocr;
+    TCCR3B |= (1 << CS31);          // /8
+    ETIMSK |= (1 << OCIE3A);        // IRQ on (Timer3는 ETIMSK)
+  }
+
+  interrupts();
+}
+
+
+// ★ 이동 중 주기적으로 현재 위치 저장
+inline void maybeSaveCurPosDuringMove() {
+  unsigned long now = millis();
+  if ((now - lastPosSaveMs) >= POS_SAVE_INTERVAL_MS) {
+    long dx = curX - lastSavedX;
+    long dy = curY - lastSavedY;
+    long dz = curZ - lastSavedZ;
+    if ( (dx>=POS_SAVE_DELTA_STEPS || dx<=-POS_SAVE_DELTA_STEPS) ||
+         (dy>=POS_SAVE_DELTA_STEPS || dy<=-POS_SAVE_DELTA_STEPS) ||
+         (dz>=POS_SAVE_DELTA_STEPS || dz<=-POS_SAVE_DELTA_STEPS) ) {
+      PersistV4 p { MAGIC_V4, curX, curY, curZ, dropSteps };
+      EEPROM.put(EEPROM_ADDR, p);
+      lastPosSaveMs = now;
+      lastSavedX = curX; lastSavedY = curY; lastSavedZ = curZ;
+    }
+  }
+}
 // OLED 화면에 X,Y,Z,D를 보기 좋게 보여주는 함수
 void updateOLED() {
-  long x = tgtX / DISPLAY_UNIT;                // 스텝을 화면 숫자로 바꿈(X)
-  long y = tgtY / DISPLAY_UNIT;                // 스텝을 화면 숫자로 바꿈(Y)
-  long z = tgtZ / DISPLAY_UNIT;                // 스텝을 화면 숫자로 바꿈(Z)
+  // ★ 수정: OLED는 “목표(tgt)”가 아니라 “현재(cur)”를 보여줌
+  long x = curX / DISPLAY_UNIT;                // 스텝을 화면 숫자로 바꿈(X)
+  long y = curY / DISPLAY_UNIT;                // 스텝을 화면 숫자로 바꿈(Y)
+  long z = curZ / DISPLAY_UNIT;                // 스텝을 화면 숫자로 바꿈(Z)
   long bursts = dropSteps / DROP_UNIT_STEPS;   // D:200xN의 N값(방울 개수 느낌)
 
   display.clearDisplay();                      // 화면 지우기
@@ -166,10 +308,68 @@ void updateOLED() {
   display.display();                            // 실제로 화면에 그리기
 }
 
+// ★ 이동 중 OLED를 ‘현재 위치 기준’으로 1칸(=DISPLAY_UNIT) 바뀔 때만 갱신
+inline void maybeUpdateOLEDWhileMoving(char axis) {
+  long ux = curX / DISPLAY_UNIT;
+  long uy = curY / DISPLAY_UNIT;
+  long uz = curZ / DISPLAY_UNIT;
+  bool changed = false;
+
+  if (axis == 'X' && ux != lastOLEDUnitX) { lastOLEDUnitX = ux; changed = true; }
+  if (axis == 'Y' && uy != lastOLEDUnitY) { lastOLEDUnitY = uy; changed = true; }
+  if (axis == 'Z' && uz != lastOLEDUnitZ) { lastOLEDUnitZ = uz; changed = true; }
+
+  if (changed) updateOLED();
+}
+
+// ──────────────────────────────────────────────────────────────
+// [추가] 인터럽트 드라이버 진행량을 메인 상태(curX/curY)에 반영
+// ──────────────────────────────────────────────────────────────
+inline void serviceAxisProgress() {
+  long d1 = 0, d3 = 0;
+
+  noInterrupts();
+  if (T1_steps_done) { d1 = T1_steps_done; T1_steps_done = 0; }
+  if (T3_steps_done) { d3 = T3_steps_done; T3_steps_done = 0; }
+  interrupts();
+
+  if (d3) { // Timer3 == X축 (보드 Z_PUL/Z_DIR을 실제 X로 사용)
+    curX += (long)T3_step_sign * d3;
+    maybeSaveCurPosDuringMove();
+    maybeUpdateOLEDWhileMoving('X');
+  }
+  if (d1) { // Timer1 == Y축 (보드 X_PUL/X_DIR을 실제 Y로 사용)
+    curY += (long)T1_step_sign * d1;
+    maybeSaveCurPosDuringMove();
+    maybeUpdateOLEDWhileMoving('Y');
+  }
+}
+
+// 모터를 정해진 스텝 수만큼 “현재값을 갱신하며” 움직이는 함수(한 축 전용)
+void moveAxisSteps(uint8_t PUL, uint8_t DIR, uint8_t dirLevel,
+                   long steps, int half_us, long &curAxis, int stepSign, char axisTag) {
+  if (steps <= 0) return;
+  digitalWrite(DIR, dirLevel);
+  delayMicroseconds(100);
+  for (long i = 0; i < steps; i++) {
+    stepHalf(PUL, half_us);
+    curAxis += stepSign;                // ★ 한 스텝마다 실제 위치 갱신
+    maybeSaveCurPosDuringMove();        // ★ 이동 체크포인트 저장
+    maybeUpdateOLEDWhileMoving(axisTag);// ★ OLED 1칸 단위 갱신
+  }
+}
+
+
 // 지금 설정(tgtX,tgtY,tgtZ,dropSteps)을 EEPROM에 즉시 저장
 void savePersistNow() {
-  PersistV3 p { MAGIC_V3, tgtX, tgtY, tgtZ, dropSteps }; // 저장할 자료 채우기
+  PersistV4 p { MAGIC_V4, curX, curY, curZ, dropSteps }; // ★ 실제 위치 저장
   EEPROM.put(EEPROM_ADDR, p);                            // EEPROM에 쓰기
+  lastSavedX = curX; lastSavedY = curY; lastSavedZ = curZ;
+  lastPosSaveMs = millis();
+  // OLED 기준값도 동기화
+  lastOLEDUnitX = curX / DISPLAY_UNIT;
+  lastOLEDUnitY = curY / DISPLAY_UNIT;
+  lastOLEDUnitZ = curZ / DISPLAY_UNIT;
 }
 
 // “조금 있다가 저장하자”라고 표시만 해두는 함수
@@ -193,73 +393,54 @@ void loadPersist() {
   uint32_t magic = 0;                                // 먼저 버전 번호(매직)를 읽을 변수
   EEPROM.get(EEPROM_ADDR, magic);                    // EEPROM에서 번호를 읽음
 
-  if (magic == MAGIC_V3) {                           
-    PersistV3 p; EEPROM.get(EEPROM_ADDR, p);         // X,Y,Z,D를 전부 읽어옴
-    tgtX = p.tgtX; tgtY = p.tgtY; tgtZ = p.tgtZ; dropSteps = p.dropSteps;
+  if (magic == MAGIC_V4) {                           
+    PersistV4 p; EEPROM.get(EEPROM_ADDR, p);         // 실제 위치/드롭값 복원
+    curX = p.curX; curY = p.curY; curZ = p.curZ;
+    dropSteps = p.dropSteps;
+    tgtX = curX; tgtY = curY; tgtZ = curZ;           // 목표도 현재와 맞춤(절대좌표 유지)
   } 
-  else {                                             // 저장된 게 없으면
-    tgtX = 0; tgtY = 0; tgtZ = 0; dropSteps = DROP_UNIT_STEPS; // 모두 0/기본값
+  else if (magic == MAGIC_V3) {                      // 구버전 호환: 목표를 실제로 간주
+    PersistV3 p; EEPROM.get(EEPROM_ADDR, p);
+    curX = p.tgtX; curY = p.tgtY; curZ = p.tgtZ;
+    dropSteps = p.dropSteps;
+    tgtX = curX; tgtY = curY; tgtZ = curZ;
   }
+  else {                                             // 저장된 게 없으면
+    curX = 0; curY = 0; curZ = 0;
+    tgtX = 0; tgtY = 0; tgtZ = 0;
+    dropSteps = DROP_UNIT_STEPS;                     // 모두 0/기본값
+  }
+
   clampXY(); clampZ(); clampDrop();                  // 읽은 값이 범위를 넘지 않게 정리
+
+  // OLED 기준값 초기화
+  lastOLEDUnitX = curX / DISPLAY_UNIT;
+  lastOLEDUnitY = curY / DISPLAY_UNIT;
+  lastOLEDUnitZ = curZ / DISPLAY_UNIT;
+}
+
+void doOneDrop() {
+  long bursts = dropSteps / DROP_UNIT_STEPS;                    // 200스텝을 몇 번 누를지 계산(N)!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  if (bursts > 0) {
+    for (long i = 0; i < bursts; i++) {               // N번 반복
+      moveAxisSteps(UD_PUL, UD_DIR, UD_DIR_DOWN, DROP_UNIT_STEPS, STEP_HALF_US, /*curAxis*/curZ, 0, 'X');
+      delay(100);                                               // 잠깐 대기(플런저가 올라가는 시간)
+    }
+  } else if (bursts < 0) {
+    for (long i = 0; i < -bursts; i++) {          // N번 반복(마이너스면 위로 올리기)
+      moveAxisSteps(UD_PUL, UD_DIR, UD_DIR_UP,   DROP_UNIT_STEPS, STEP_HALF_US, /*curAxis*/curZ, 0, 'X');
+      delay(100);                                       // 잠깐 대기(플런저가 내려가는 시간)
+    }
+  }
+  savePersistNow();
 }
 
 //
 // 현재 위치(curX/Y/Z)에서 목표 위치(tgtX/Y/Z)까지 실제로 모터를 움직이는 함수
 //
-void goToTargetXYZ() {
-  clampXY(); clampZ();                               // 목표가 범위를 넘었으면 먼저 정리
 
-  long dx = tgtX - curX;                             // X축으로 얼마나 더 가야 하는지
-  if (dx > 0) {                                      // 목표가 오른쪽(+)에 있으면
-    moveSteps(Z_PUL, Z_DIR, X_DIR_POS,  dx, STEP_HALF_US); // X모터를 +방향으로 dx만큼 이동
-    curX += dx;                                      // 현재 X를 목표로 갔다고 기록
-  }
-  else if (dx < 0) {                                 // 목표가 왼쪽(-)에 있으면
-    moveSteps(Z_PUL, Z_DIR, X_DIR_NEG, -dx, STEP_HALF_US); // X모터를 -방향으로 |dx|만큼 이동
-    curX += dx;                                      // 현재 X 갱신
-  }
-
-  long dy = tgtY - curY;                             // Y축으로 얼마나 더 가야 하는지
-  if (dy > 0) {                                      // 목표가 앞쪽(+)이면
-    moveSteps(X_PUL, X_DIR, STAGEY_DIR_POS,  dy, STEP_HALF_US); // Y모터 +방향 이동
-    curY += dy;                                      // 현재 Y 갱신
-  }
-  else if (dy < 0) {                                 // 목표가 뒤쪽(-)이면
-    moveSteps(X_PUL, X_DIR, STAGEY_DIR_NEG, -dy, STEP_HALF_US); // Y모터 -방향 이동
-    curY += dy;                                      // 현재 Y 갱신
-  }
-  long dz = tgtZ;                            // Z축으로 얼마나 더 가야 하는지
-  if (dz > 0) {                                      // 목표가 위쪽(+)이면
-    moveSteps(Y_PUL, Y_DIR, LIFT_DIR_UP,   dz, STEP_HALF_US);   // Z모터 위로 이동                             
-  }
-  else if (dz < 0) {                                 // 목표가 아래(-)이면
-    moveSteps(Y_PUL, Y_DIR, LIFT_DIR_DOWN, -dz, STEP_HALF_US);  // Z모터 아래로 이동                  
-  }
-}
 
 // GO 버튼을 눌렀을 때 하는 동작(한 번 작업: 이동 → 프리다운 → 플런저 누르기 → 복귀)
-
-void doOneDrop() {
-  long dz = tgtZ;
-  moveSteps(Y_PUL, Y_DIR, LIFT_DIR_DOWN, Y_PRE_DOWN_STEPS, STEP_HALF_US); // 리프트(Z)를 살짝 내려 액체가 잘 떨어지게 준비
-
-  long bursts = dropSteps / DROP_UNIT_STEPS;                    // 200스텝을 몇 번 누를지 계산(N)!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-  if (bursts > 0) {
-    for (long i = 0; i < bursts; i++) {               // N번 반복
-      moveSteps(UD_PUL, UD_DIR, UD_DIR_DOWN, DROP_UNIT_STEPS, STEP_HALF_US); // 플런저를 200스텝 아래로 내려서 준비
-      delay(100);                                               // 잠깐 대기(플런저가 올라가는 시간)
-    }
-  } else if (bursts < 0) {
-    for (long i = 0; i < -bursts; i++) {          // N번 반복(마이너스면 위로 올리기)
-      moveSteps(UD_PUL, UD_DIR, UD_DIR_UP, DROP_UNIT_STEPS, STEP_HALF_US); // 플런저를 200스텝 위로 올려서 액체가 나오지 않게
-      delay(100);                                       // 잠깐 대기(플런저가 내려가는 시간)
-    }
-  }
-  moveSteps(Y_PUL, Y_DIR, LIFT_DIR_UP, Y_PRE_DOWN_STEPS, STEP_HALF_US);     // 리프트(Z)를 원래 높이로 올리기
-  if(dz < 0) {
-    moveSteps(Y_PUL, Y_DIR, LIFT_DIR_UP, -dz, STEP_HALF_US); // 목표 Z가 음수면 다시 올려서 원래 높이로 맞추기
-  }
-}
 
 //
 // 버튼들을 한 자리에서 관리하기 위한 배열과 번호들
@@ -450,22 +631,15 @@ void setup() {
     btnLastRepeat[i]  = 0;                          // 반복 시각 초기화
   }
 
-  unsigned long t0 = millis();                      // 전원 켠 시각 기록
-  while (millis() - t0 < 2000) {                    // 처음 2초 동안
-    if (digitalRead(BTN_RESET00) == HIGH) break;    // RESET 버튼에서 손을 떼면 중단
-  }
-  if (digitalRead(BTN_RESET00) == LOW) {            // 2초 동안 계속 RESET을 누르고 있었다면
-    tgtX = 0; tgtY = 0; tgtZ = 0;                   // 목표 X,Y,Z를 0으로
-    dropSteps = DROP_UNIT_STEPS;                    // D도 200으로
-    clampXY(); clampZ(); clampDrop();               // 안전 범위로 정리
-    savePersistNow();                               // 바로 EEPROM에 저장
-  } else {                                          // RESET을 길게 누르지 않았다면
-    loadPersist();                                  // EEPROM에서 이전 값 읽어오기
-    clampXY(); clampZ(); clampDrop();               // 안전 범위로 정리
-  }
+  loadPersist();                                    // EEPROM에서 마지막 실제 위치/드롭값 복원
+  clampXY(); clampZ(); clampDrop();                 // 안전 범위로 정리
 
-  curX = tgtX; curY = tgtY;           // 현재 위치를 목표 위치와 똑같이 맞춤(전원 켤 때 급히 안 움직이게)
-  updateOLED();                                      // 화면에 처음 값 표시
+  // OLED 기준값 초기화
+  lastOLEDUnitX = curX / DISPLAY_UNIT;
+  lastOLEDUnitY = curY / DISPLAY_UNIT;
+  lastOLEDUnitZ = curZ / DISPLAY_UNIT;
+
+  updateOLED();                                      // 화면에 처음 값 표시(현재 위치 기준)
 }
 
 
@@ -742,6 +916,81 @@ void UartRxProtocol()
       }
   }
 }
+void moveAxisSteps_ISR(uint8_t PUL, uint8_t DIR, uint8_t dirLevel,
+                       long steps, int half_us, long &curAxis, int stepSign, char axisTag) {
+  if (steps <= 0) return;
+
+  // 축→타이머 매핑
+  uint8_t timer_id = 0;
+  if (axisTag == 'X') timer_id = 3;      // X == Timer3
+  else if (axisTag == 'Y') timer_id = 1; // Y == Timer1
+  else {
+    // Z나 플런저 등은 기존 블로킹 버전 사용
+    moveAxisSteps(PUL, DIR, dirLevel, steps, half_us, curAxis, stepSign, axisTag);
+    return;
+  }
+
+  // 타이머 드라이버 시동
+  startTimerMotor(timer_id, PUL, DIR, dirLevel, steps, half_us, (int8_t)stepSign);
+
+  // 완료까지 대기하되, 진행량/저장/UART 수신은 계속 처리
+  for (;;) {
+    serviceAxisProgress();   // ISR 누적분을 curX/curY에 반영 + OLED/저장 스로틀
+    UartRxProtocol();        // 시리얼 수신 버퍼링(파싱만, 실행은 메인에서)
+    trySaveIfIdle();         // 지연 저장
+
+    bool done = (timer_id == 3) ? (T3_steps_remaining == 0) : (T1_steps_remaining == 0);
+    if (done) break;
+  }
+
+  // 잔여 반영
+  serviceAxisProgress();
+}
+void goToTargetXYZ() { //x축과 y축 동시 움직임
+  
+
+  if (isMoving) return;                         // 재진입 방지
+  isMoving = true;
+
+  clampXY(); clampZ();                          // 목표가 범위를 넘었으면 먼저 정리
+
+  long dx = tgtX - curX;                        // X축으로 얼마나 더 가야 하는지
+  if (dx > 0) {                                 // 목표가 오른쪽(+)
+    // ★ X축: 타이머 ISR 버전 사용 (Timer3, 핀은 Z_PUL/Z_DIR)
+    moveAxisSteps_ISR(Z_PUL, Z_DIR, X_DIR_POS,  dx, STEP_HALF_US, curX, +1, 'X');
+  }
+  else if (dx < 0) {                            // 목표가 왼쪽(-)
+    moveAxisSteps_ISR(Z_PUL, Z_DIR, X_DIR_NEG, -dx, STEP_HALF_US, curX, -1, 'X');
+  }
+
+  long dy = tgtY - curY;                        // Y축으로 얼마나 더 가야 하는지
+  if (dy > 0) {                                 // 목표가 앞쪽(+)
+    // ★ Y축: 타이머 ISR 버전 사용 (Timer1, 핀은 X_PUL/X_DIR)
+    moveAxisSteps_ISR(X_PUL, X_DIR, STAGEY_DIR_POS,  dy, STEP_HALF_US, curY, +1, 'Y');
+  }
+  else if (dy < 0) {                            // 목표가 뒤쪽(-)
+    moveAxisSteps_ISR(X_PUL, X_DIR, STAGEY_DIR_NEG, -dy, STEP_HALF_US, curY, -1, 'Y');
+  }
+
+  long dz = tgtZ - curZ;                        // Z축으로 얼마나 더 가야 하는지
+  if (dz > 0) {                                 // 목표가 위쪽(+)
+    // ★ Z는 기존 블로킹 버전 유지
+    moveAxisSteps(Y_PUL, Y_DIR, LIFT_DIR_UP,   dz, STEP_HALF_US, curZ, +1, 'Z');
+  }
+  else if (dz < 0) {                            // 목표가 아래(-)
+    moveAxisSteps(Y_PUL, Y_DIR, LIFT_DIR_DOWN, -dz, STEP_HALF_US, curZ, -1, 'Z');
+  }
+
+  doOneDrop();                                   // 플런저 동작
+
+  // Z 복귀
+  moveAxisSteps(Y_PUL, Y_DIR, LIFT_DIR_UP, -dz, STEP_HALF_US, curZ, +1, 'Z');
+
+  // 목표 도달 스냅샷
+  savePersistNow();
+
+  isMoving = false;
+}
 
 
 void Serial_Main0(void) 
@@ -775,8 +1024,11 @@ void Serial_Main0(void)
         dropSteps = (long)F1 * DROP_UNIT_STEPS;   
         clampXY(); clampZ(); clampDrop();
         updateOLED();         
-        goToTargetXYZ();
-        doOneDrop();
+
+        // ★ 재진입 방지: 이미 이동 중이면 즉시 goToTargetXYZ() 재호출을 막음
+        if (!isMoving) {
+          goToTargetXYZ();
+        }
         requestSave();
         trySaveIfIdle();
 
@@ -850,6 +1102,9 @@ void Serial_Main0(void)
 //
 void loop() {
   bool changed = false;                              // 화면을 새로 그릴지 알려주는 표시
+
+  // ★ 인터럽트 진행량 반영을 주기적으로 수행 (OLED/저장 스로틀도 같이)
+  serviceAxisProgress();
  
   UartRxProtocol();
   Serial_Main0();
@@ -906,20 +1161,27 @@ void loop() {
     dropSteps = DROP_UNIT_STEPS;                     // D를 200으로
     clampXY(); clampZ(); clampDrop();                // 안전 범위 정리
     updateOLED();                                    // 화면을 먼저 바꾸고
-                                   // 그 다음 실제로 이동
-    curX = 0; curY = 0;                   // 현재 위치도 0으로 기록
+
+    // 실제로 이동 (이동 중이면 재진입 방지)
+    if (!isMoving) {
+      goToTargetXYZ();                               // 이동 수행(타이머 기반 X/Y + 기존 Z/플런저)
+    }
+
     savePersistNow();                                // 바로 저장
     changed = true;                                  // 화면 갱신 표시
   }
 
-  if (changed) updateOLED();                         // 값이 바뀌었으면 화면 새로 그림
+  if (changed) updateOLED();                         // 값이 바뀌었으면 화면 새로 그림(현재 위치 기준)
 
   // ----- GO: 목표 자리로 이동하고, D만큼(200xN) 플런저를 눌러 액체를 떨어뜨림 -----
   uint8_t e4 = pollBtn(IDX_GO);                      // GO 버튼 상태
   if (e4 == EV_PRESS) {                              // 딱 한 번 눌림이면
-    doOneDrop();                                     // 한 번 작업 실행
-    savePersistNow();                                // 끝난 뒤 저장
-    updateOLED();                                    // 화면 갱신
+    if (!isMoving) {
+      goToTargetXYZ();                               // 목표로 이동(절대 좌표)
+      doOneDrop();                                   // 한 번 작업 실행
+      savePersistNow();                              // 끝난 뒤 저장
+      updateOLED();                                  // 화면 갱신(현재 위치 기준)
+    }
   }
 
   trySaveIfIdle();                                   // 값이 더 안 바뀌면 1.5초 뒤 EEPROM 저장
