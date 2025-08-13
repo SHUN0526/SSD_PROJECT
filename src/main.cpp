@@ -86,8 +86,8 @@ bool needSave = false;                   // 조금 있다 저장할 게 있는�
 unsigned long lastEditMs = 0;            // 마지막으로 값이 바뀐 시간
 const unsigned long SAVE_DELAY_MS = 100; // 바뀐 뒤 0.1초 지나면 실제 저장
 
-const unsigned long POS_SAVE_INTERVAL_MS = 50; // 이동 중, 0.05초마다 저장할지 확인
-const long          POS_SAVE_DELTA_STEPS = 50; // 50스텝 이상 움직였을 때만 저장
+const unsigned long POS_SAVE_INTERVAL_MS = 100; // 이동 중, 0.1초마다 저장할지 확인
+const long          POS_SAVE_DELTA_STEPS = 200; // 200스텝 이상 움직였을 때만 저장
 unsigned long lastPosSaveMs = 0;               // 마지막으로 저장한 시각
 long lastSavedX = 0, lastSavedY = 0, lastSavedZ = 0, lastSavedUD = 0; // 마지막 저장된 위치들
 
@@ -133,9 +133,9 @@ volatile bool     T2_pulse_state = false;// Z 펄스 토글 상태
 // Timer1 ISR — 일정 시간마다 자동으로 불려 Y 펄스를 만듦
 ISR(TIMER1_COMPA_vect) {
   if (T1_steps_remaining > 0) {          // 아직 갈 스텝이 남아있으면
-    if (T1_pulse_state) { *T1_PUL_PORT |=  T1_PUL_MASK; }  // 이번엔 HIGH
-    else { *T1_PUL_PORT &= ~T1_PUL_MASK; T1_steps_remaining--; T1_steps_done++; } // 다음엔 LOW + 1스텝 완료
-    T1_pulse_state = !T1_pulse_state;    // 다음 번엔 반대로
+    if (T1_pulse_state) { *T1_PUL_PORT |=  T1_PUL_MASK; }  // 이번엔 HIGH -- OR..... 레지스터 오픈 - 핀 번호 수정 ... 그 비트만 1로 만들기
+    else { *T1_PUL_PORT &= ~T1_PUL_MASK; T1_steps_remaining--; T1_steps_done++; } // 다음엔 LOW + 1스텝 완료 -- AND그리고 값 다 바꾸기... 그 비트만 0으로 만들기
+    T1_pulse_state = !T1_pulse_state;    // 다음 번엔 반대로.... 토글
   } else {                                // 다 갔으면
     TIMSK &= ~(1 << OCIE1A);             // 이 타이머 인터럽트 끄기
     *T1_PUL_PORT &= ~T1_PUL_MASK;        // 펄스 핀 LOW로 정리
